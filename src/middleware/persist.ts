@@ -28,6 +28,9 @@ type JsonStorageOptions = {
   replacer?: (key: string, value: unknown) => unknown
 }
 
+const isPromiseLike = (value: unknown): value is PromiseLike<unknown> =>
+  typeof (value as PromiseLike<unknown>)?.then === 'function'
+
 export function createJSONStorage<S, R = unknown>(
   getStorage: () => StateStorage<R>,
   options?: JsonStorageOptions,
@@ -36,7 +39,7 @@ export function createJSONStorage<S, R = unknown>(
   try {
     storage = getStorage()
   } catch {
-    // prevent error if the storage is not defined (e.g. when server side rendering a page)
+    // prevent error if the storage is not defined (e.g. when server-side rendering)
     return
   }
   const persistStorage: PersistStorage<S, R> = {
@@ -110,10 +113,7 @@ export interface PersistOptions<
   merge?: (persistedState: unknown, currentState: S) => S
 
   /**
-   * An optional boolean that will prevent the persist middleware from triggering hydration on initialization,
-   * This allows you to call `rehydrate()` at a specific point in your apps rendering life-cycle.
-   *
-   * This is useful in SSR application.
+   * An optional boolean that will prevent the persist middleware from triggering hydration on initialization.
    *
    * @default false
    */
@@ -125,7 +125,6 @@ type PersistListener<S> = (state: S) => void
 type StorePersist<S, Ps, Pr> = S extends {
   getState: () => infer T
   setState: {
-    // capture both overloads of setState
     (...args: infer Sa1): infer Sr1
     (...args: infer Sa2): infer Sr2
   }
@@ -156,9 +155,6 @@ type Thenable<Value> = {
   finally(onFinally?: (() => unknown) | null): Thenable<Value>
 }
 
-const isPromiseLike = (value: unknown): value is PromiseLike<unknown> =>
-  typeof (value as PromiseLike<unknown>)?.then === 'function'
-
 const toThenable =
   <Result, Input>(
     fn: (input: Input) => Result | PromiseLike<Result>,
@@ -182,9 +178,11 @@ const toThenable =
     return {
       then<Fulfilled = Result, Rejected = never>(
         onFulfilled?:
-          ((value: Result) => Fulfilled | PromiseLike<Fulfilled>) | null,
+          | ((value: Result) => Fulfilled | PromiseLike<Fulfilled>)
+          | null,
         onRejected?:
-          ((reason: unknown) => Rejected | PromiseLike<Rejected>) | null,
+          | ((reason: unknown) => Rejected | PromiseLike<Rejected>)
+          | null,
       ): Thenable<Fulfilled | Rejected> {
         return toThenable(() => {
           if (failed) {
@@ -229,8 +227,6 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
   }
 
   let hasHydrated = false
-  // Counter to track hydration versions and prevent race conditions
-  // when multiple rehydrate() calls happen concurrently
   let hydrationVersion = 0
   const hydrationListeners = new Set<PersistListener<S>>()
   const finishHydrationListeners = new Set<PersistListener<S>>()
@@ -275,21 +271,11 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
 
   api.getInitialState = () => configResult
 
-  // a workaround to solve the issue of not storing rehydrated state in sync storage
-  // the set(state) value would be later overridden with initial state by create()
-  // to avoid this, we merge the state from localStorage into the initial state.
   let stateFromStorage: S | undefined
 
-  // rehydrate initial state with existing stored state
   const hydrate = () => {
     if (!storage) return
 
-    // On the first invocation of 'hydrate', state will not yet be defined (this is
-    // true for both the 'asynchronous' and 'synchronous' case). Pass 'configResult'
-    // as a backup  to 'get()' so listeners and 'onRehydrateStorage' are called with
-    // the latest available state.
-
-    // Increment version to invalidate any in-flight hydration
     const currentVersion = ++hydrationVersion
     hasHydrated = false
     hydrationListeners.forEach((cb) => cb(get() ?? configResult))
@@ -297,7 +283,6 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
     const postRehydrationCallback =
       options.onRehydrateStorage?.(get() ?? configResult) || undefined
 
-    // bind is used to avoid `TypeError: Illegal invocation` error
     return toThenable(storage.getItem.bind(storage))(options.name)
       .then((deserializedStorageValue) => {
         if (deserializedStorageValue) {
@@ -325,7 +310,6 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
         return [false, undefined] as const
       })
       .then((migrationResult) => {
-        // Abort if a newer hydration has started
         if (currentVersion !== hydrationVersion) {
           return
         }
@@ -345,29 +329,20 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
           ) {
             return writeResult
           }
-          // Keep non-native write returns as values, including older internal
-          // Thenables. Asynchronous chains still adopt the returned value.
           return toThenable(() => writeResult, false)(undefined)
         }
       })
       .then(() => {
-        // Abort if a newer hydration has started
         if (currentVersion !== hydrationVersion) {
           return
         }
         postRehydrationCallback?.(get(), undefined)
 
-        // It's possible that 'postRehydrationCallback' updated the state. To ensure
-        // that isn't overwritten when returning 'stateFromStorage' below
-        // (synchronous-case only), update 'stateFromStorage' to point to the latest
-        // state. In the asynchronous case, 'stateFromStorage' isn't used after this
-        // callback, so there's no harm in updating it to match the latest state.
         stateFromStorage = get()
         hasHydrated = true
         finishHydrationListeners.forEach((cb) => cb(stateFromStorage as S))
       })
       .then(undefined, (e: unknown) => {
-        // Abort if a newer hydration has started
         if (currentVersion !== hydrationVersion) {
           return
         }
